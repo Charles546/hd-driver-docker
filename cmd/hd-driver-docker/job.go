@@ -18,6 +18,7 @@ import (
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/mount"
+	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/honeydipper/honeydipper/v4/pkg/dipper"
 )
@@ -386,7 +387,7 @@ func (d *dockerDriver) createJob(msg *dipper.Message) {
 			panic(err)
 		}
 		if !exists {
-			if err := api.CreateVolume(ctx, name); err != nil {
+			if err := api.CreateVolume(ctx, volume.CreateOptions{Name: name}); err != nil {
 				panic(err)
 			}
 		}
@@ -695,7 +696,7 @@ func removeJob(ctx context.Context, api jobAPI, job string) error {
 		}
 	}
 	if ownedVolume != "" {
-		if err := api.RemoveVolume(ctx, ownedVolume); err != nil {
+		if err := api.RemoveVolume(ctx, ownedVolume, false); err != nil {
 			if isNotFound(err) {
 				return nil
 			}

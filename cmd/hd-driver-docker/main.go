@@ -49,10 +49,10 @@ func main() {
 	docker.DefaultTimeout["wait_job"] = "30m"
 	docker.Commands["get_job_log"] = docker.getJobLog
 	docker.Commands["delete_job"] = docker.deleteJob
-	// exec / create_volume / delete_volume / get_pod_log_tail belong to Phase 2
-	// (exec, volumes, log-tail streaming RPC). They are registered now so the
-	// driver's command surface is stable; until Phase 2 lands their handlers
-	// reply with a clean "not implemented in phase 1" error.
+	// exec / create_volume / delete_volume and the get_pod_log_tail RPC are the
+	// Phase 2 command surface (exec, volumes, log-tail streaming RPC), which
+	// the operator/UI consumes via the shared fatalSetStatus container-state
+	// builder from Phase 1.
 	docker.Commands["exec"] = docker.exec
 	docker.Commands["create_volume"] = docker.createVolume
 	docker.Commands["delete_volume"] = docker.deleteVolume

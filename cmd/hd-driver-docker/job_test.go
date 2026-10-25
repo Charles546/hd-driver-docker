@@ -17,6 +17,7 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/network"
+	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/honeydipper/honeydipper/v4/pkg/dipper"
@@ -24,7 +25,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// fakeJobAPI is an in-memory jobAPI used to exercise the lifecycle logic.
+// fakeJobAPI is an in-memory jobAPI used to exercise the lifecycle, exec,
+// volume and log-tail logic.
 type fakeJobAPI struct {
 	states     map[string]containerState
 	waitCodes  map[string]int64
@@ -34,6 +36,22 @@ type fakeJobAPI struct {
 	inspectErr map[string]error
 	removeErr  map[string]error
 	volumes    map[string]bool
+	// logStreams keyed by container ID: raw stream bytes returned by
+	// ContainerLogs. Stored as bytes so each call returns a fresh reader (the
+	// handler re-fetches the same container during the done-phase re-chunk).
+	logStreams map[string][]byte
+	// logOpts records the LogsOptions passed to ContainerLogs per container.
+	logOpts map[string]container.LogsOptions
+	// execIDs maps containerID -> exec ID to return from ExecCreate.
+	execIDs map[string]string
+	// execStreams maps execID -> stream returned from ExecAttach.
+	execStreams map[string]io.ReadCloser
+	// execInspects maps execID -> inspect result returned from ExecInspect.
+	execInspects map[string]container.ExecInspect
+	// removeVolumeForce records the force flag per volume name.
+	removeVolumeForce map[string]bool
+	// createdVolumes records the volume.CreateOptions passed to CreateVolume.
+	createdVolumes []volume.CreateOptions
 }
 
 func newFakeJobAPI() *fakeJobAPI {
@@ -128,8 +146,50 @@ func (f *fakeJobAPI) ListContainers(ctx context.Context, jobID string) ([]jobCon
 
 func (f *fakeJobAPI) ContainerLogs(ctx context.Context, id string, opts container.LogsOptions) (io.ReadCloser, error) {
 	f.record("logs:" + id)
+	if f.logOpts == nil {
+		f.logOpts = map[string]container.LogsOptions{}
+	}
+	f.logOpts[id] = opts
+	if f.logStreams != nil {
+		if data, ok := f.logStreams[id]; ok {
+			return io.NopCloser(bytes.NewReader(data)), nil
+		}
+	}
 
 	return io.NopCloser(bytes.NewReader(nil)), nil
+}
+
+func (f *fakeJobAPI) ExecCreate(ctx context.Context, containerID string, opts container.ExecOptions) (string, error) {
+	f.record("execCreate:" + containerID)
+	if f.execIDs != nil {
+		if id, ok := f.execIDs[containerID]; ok {
+			return id, nil
+		}
+	}
+
+	return "exec-" + containerID, nil
+}
+
+func (f *fakeJobAPI) ExecAttach(ctx context.Context, execID string, opts container.ExecAttachOptions) (io.ReadCloser, error) {
+	f.record("execAttach:" + execID)
+	if f.execStreams != nil {
+		if rc, ok := f.execStreams[execID]; ok {
+			return rc, nil
+		}
+	}
+
+	return io.NopCloser(bytes.NewReader(nil)), nil
+}
+
+func (f *fakeJobAPI) ExecInspect(ctx context.Context, execID string) (container.ExecInspect, error) {
+	f.record("execInspect:" + execID)
+	if f.execInspects != nil {
+		if ins, ok := f.execInspects[execID]; ok {
+			return ins, nil
+		}
+	}
+
+	return container.ExecInspect{Running: false, ExitCode: 0}, nil
 }
 
 func (f *fakeJobAPI) VolumeExists(ctx context.Context, name string) (bool, error) {
@@ -138,15 +198,23 @@ func (f *fakeJobAPI) VolumeExists(ctx context.Context, name string) (bool, error
 	return f.volumes[name], nil
 }
 
-func (f *fakeJobAPI) CreateVolume(ctx context.Context, name string) error {
-	f.record("createVolume:" + name)
-	f.volumes[name] = true
+func (f *fakeJobAPI) CreateVolume(ctx context.Context, opts volume.CreateOptions) error {
+	f.record("createVolume:" + opts.Name)
+	f.createdVolumes = append(f.createdVolumes, opts)
+	if f.volumes == nil {
+		f.volumes = map[string]bool{}
+	}
+	f.volumes[opts.Name] = true
 
 	return nil
 }
 
-func (f *fakeJobAPI) RemoveVolume(ctx context.Context, name string) error {
+func (f *fakeJobAPI) RemoveVolume(ctx context.Context, name string, force bool) error {
 	f.record("removeVolume:" + name)
+	if f.removeVolumeForce == nil {
+		f.removeVolumeForce = map[string]bool{}
+	}
+	f.removeVolumeForce[name] = force
 
 	return nil
 }
