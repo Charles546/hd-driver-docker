@@ -1,0 +1,41 @@
+name: Release And Update Registry
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to publish (for example v0.2.0)"
+        required: true
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.tag.outputs.release_tag }}
+    steps:
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "release_tag=${{ github.event.inputs.release_tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "release_tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          fi
+
+  release:
+    needs: prepare
+    uses: Charles546/honeydipper-registry/.github/workflows/release-driver.yml@main
+    with:
+      driver_name: docker
+      binary_name: hd-driver-docker
+      go_build_path: ./cmd/hd-driver-docker
+      release_tag: ${{ needs.prepare.outputs.release_tag }}
+      manifest_file: docker.json
+      build_image: ''
+      cgo_enabled: "0"
+      mirror_url: https://charles546.github.io/honeydipper-registry/artifacts/hd-driver-docker/${{ needs.prepare.outputs.release_tag }}/linux-amd64/hd-driver-docker
+    secrets:
+      registry_repo_token: ${{ secrets.REGISTRY_REPO_TOKEN }}
