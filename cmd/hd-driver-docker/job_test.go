@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strings"
 	"testing"
 
 	"github.com/docker/docker/api/types/container"
@@ -444,6 +445,20 @@ func TestDeleteOnSuccessOnlyOnSuccess(t *testing.T) {
 	assert.False(t, api3.hasOp("remove:main"))
 }
 
+func TestDeleteOnSuccessSkipsStillRunningJob(t *testing.T) {
+	// A mid-run get_job_log sees a running main: fatalSetStatus reports success
+	// (running does not flip status), so cleanup must be gated on done==true too
+	// — otherwise delete_on_success would stop and remove the running main.
+	api := newFakeJobAPI()
+	api.listResult = []jobContainer{{ID: "main", Name: "main", Role: string(roleMain), Index: 0}}
+	api.states["main"] = containerState{ID: "main", Name: "main", Index: 0, Status: container.StateRunning, Running: true}
+
+	_, labels, err := fetchJobLog(context.Background(), api, "hd-sess-1", true)
+	require.NoError(t, err)
+	assert.Equal(t, dipper.SUCCESS, labels["status"])
+	assert.False(t, api.hasOp("remove:main"), "delete_on_success must not clean up a still-running job")
+}
+
 // --- delete_job ----------------------------------------------------------------
 
 func TestDeleteJobIdempotentOnNotFound(t *testing.T) {
@@ -509,6 +524,109 @@ func TestJobNaming(t *testing.T) {
 	assert.Equal(t, "hd-init-0-hd-sess-3-c", jobContainerName("hd-init-0", "sess", "3"))
 }
 
+// --- image pull stream error decoding ------------------------------------------
+
+func TestPullStreamErrorSuccess(t *testing.T) {
+	stream := strings.Join([]string{
+		`{"status":"Pulling from library/busybox"}`,
+		`{"status":"Digest: sha256:abcdef123456"}`,
+		`{"status":"Status: Downloaded newer image for busybox:latest"}`,
+	}, "\n") + "\n"
+	assert.NoError(t, pullStreamError(strings.NewReader(stream), "busybox"))
+}
+
+func TestPullStreamErrorSurfacesStreamError(t *testing.T) {
+	stream := `{"errorDetail":{"message":"pull access denied for missing/repo, repository does not exist or may require 'docker login': denied: requested access to the resource is denied"},"error":"pull access denied for missing/repo, repository does not exist or may require 'docker login': denied: requested access to the resource is denied"}` + "\n"
+	err := pullStreamError(strings.NewReader(stream), "missing/repo")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "missing/repo")
+	assert.Contains(t, err.Error(), "pull access denied")
+}
+
+func TestPullStreamErrorSurfacesTopLevelErrorField(t *testing.T) {
+	// Some failures arrive only in the deprecated top-level `error` field.
+	stream := `{"status":"Pulling from missing/repo","error":"manifest unknown"}` + "\n"
+	err := pullStreamError(strings.NewReader(stream), "missing/repo")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "manifest unknown")
+}
+
+// --- wait_job handler-level tests ------------------------------------------------
+
+// newTestDriver builds a driver whose jobAPI is a fake, so handler-level tests
+// can exercise the full command path (payload -> reply) without a Docker daemon.
+func newTestDriver(api jobAPI) *dockerDriver {
+	d := &dockerDriver{Driver: dipper.NewDriver("test", "docker")}
+	d.jobAPIFor = func(ctx context.Context, _ *dipper.Message) (context.Context, jobAPI) {
+		return ctx, api
+	}
+
+	return d
+}
+
+// waitJobMessage is a helper to invoke the wait_job handler with a reply channel.
+func waitJobMessage(t *testing.T, d *dockerDriver) dipper.Message {
+	t.Helper()
+	reply := make(chan dipper.Message, 1)
+	d.waitJob(&dipper.Message{
+		Payload: map[string]any{"pod_id": "hd-sess-1"},
+		Labels:  map[string]string{"sessionID": "sess", "cursor": "1"},
+		Reply:   reply,
+	})
+
+	return <-reply
+}
+
+func TestWaitJobPreExitedInitFailureRepliesImmediately(t *testing.T) {
+	api := newFakeJobAPI()
+	d := newTestDriver(api)
+	api.listResult = []jobContainer{
+		{ID: "init0", Name: "init0", Role: string(roleInit), Index: 0},
+		{ID: "main", Name: "main", Role: string(roleMain), Index: 1},
+	}
+	// init0 already failed; start_job skipped main, which is still "created".
+	api.states["init0"] = containerState{ID: "init0", Status: container.StateExited, ExitCode: 2}
+	api.states["main"] = containerState{ID: "main", Status: container.StateCreated}
+
+	got := waitJobMessage(t, d)
+	assert.Equal(t, dipper.FAILURE, got.Labels["status"])
+	assert.Contains(t, got.Labels["reason"], "init0")
+	// Must NOT wait on the never-started main: Docker's Wait on a "created"
+	// container blocks until timeout (30m, retried 3x).
+	assert.False(t, api.hasOp("wait:main"), "must not wait on a never-started main")
+}
+
+func TestWaitJobSuccessWhenMainAlreadyTerminal(t *testing.T) {
+	api := newFakeJobAPI()
+	d := newTestDriver(api)
+	api.listResult = []jobContainer{
+		{ID: "init0", Name: "init0", Role: string(roleInit), Index: 0},
+		{ID: "main", Name: "main", Role: string(roleMain), Index: 1},
+	}
+	api.states["init0"] = containerState{ID: "init0", Status: container.StateExited, ExitCode: 0}
+	api.states["main"] = containerState{ID: "main", Status: container.StateExited, ExitCode: 0}
+
+	got := waitJobMessage(t, d)
+	assert.Equal(t, dipper.SUCCESS, got.Labels["status"])
+	assert.False(t, api.hasOp("wait:main"), "already-terminal main must not be waited on")
+}
+
+func TestWaitJobWaitsForRunningMain(t *testing.T) {
+	api := newFakeJobAPI()
+	d := newTestDriver(api)
+	api.listResult = []jobContainer{
+		{ID: "init0", Name: "init0", Role: string(roleInit), Index: 0},
+		{ID: "main", Name: "main", Role: string(roleMain), Index: 1},
+	}
+	api.states["init0"] = containerState{ID: "init0", Status: container.StateExited, ExitCode: 0}
+	api.states["main"] = containerState{ID: "main", Status: container.StateRunning, Running: true}
+	api.waitCodes["main"] = 0
+
+	got := waitJobMessage(t, d)
+	assert.Equal(t, dipper.SUCCESS, got.Labels["status"])
+	assert.True(t, api.hasOp("wait:main"), "a running main must be waited on")
+}
+
 // --- stdcopy frame decoding -----------------------------------------------------
 
 func TestDecodeJobLogStdCopy(t *testing.T) {
@@ -519,9 +637,28 @@ func TestDecodeJobLogStdCopy(t *testing.T) {
 	_, _ = stderr.Write([]byte("err-line-1\n"))
 	_, _ = stdout.Write([]byte("out-line-2\n"))
 
-	text, err := decodeJobLog(&framed)
+	text, err := decodeJobLog(&framed, false)
 	require.NoError(t, err)
 	assert.Equal(t, "out-line-1\nerr-line-1\nout-line-2\n", text)
+}
+
+func TestDecodeJobLogTTY(t *testing.T) {
+	// A TTY container's log stream is raw (not 8-byte-framed); running it
+	// through stdcopy would misinterpret payload bytes as frame headers, so it
+	// must be read verbatim.
+	raw := "line-1\nline-2\nline-3\n"
+	text, err := decodeJobLog(strings.NewReader(raw), true)
+	require.NoError(t, err)
+	assert.Equal(t, raw, text)
+}
+
+func TestDecodeJobLogTTYNonAsciiRaw(t *testing.T) {
+	// Payload bytes that happen to look like a stdcopy frame header (e.g. the
+	// byte 0x01) must not be treated as framing when tty is true.
+	raw := string([]byte{0x01, 0x02, 0x03, 'h', 'i', '\n'})
+	text, err := decodeJobLog(strings.NewReader(raw), true)
+	require.NoError(t, err)
+	assert.Equal(t, raw, text)
 }
 
 // --- helpers -------------------------------------------------------------------

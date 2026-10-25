@@ -8,6 +8,9 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"strconv"
 	"strings"
@@ -79,10 +82,43 @@ func (d *dockerJobAPI) PullImage(ctx context.Context, ref string) error {
 		return err
 	}
 	defer func() { _ = rc.Close() }()
-	// Drain the pull output stream so the pull completes before we proceed.
-	_, err = io.Copy(io.Discard, rc)
+	// ImagePull returns a stream of JSON progress messages; failures (auth,
+	// manifest unknown, network) arrive as {"error": ...} messages IN the stream
+	// rather than as an error from ImagePull, so the stream must be scanned for
+	// them instead of being discarded.
+	return pullStreamError(rc, ref)
+}
 
-	return err
+// pullErrorMessage is the subset of an ImagePull progress message that carries a
+// failure. The daemon emits {"errorDetail": {"message": ...}} (and, in older
+// versions, a top-level "error" field) when a pull fails.
+type pullErrorMessage struct {
+	ErrorDetail *struct{ Message string } `json:"errorDetail"`
+	Error       string                    `json:"error"`
+}
+
+// pullStreamError scans an ImagePull JSON progress stream and returns the first
+// error message found (wrapped with the image ref), or nil when the pull
+// succeeded. Without this, a failed pull would be reported as done and only
+// surface later as a confusing "No such image" error from CreateContainer.
+func pullStreamError(rc io.Reader, ref string) error {
+	dec := json.NewDecoder(rc)
+	for {
+		var msg pullErrorMessage
+		if err := dec.Decode(&msg); err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+
+			return fmt.Errorf("error reading image pull stream for %s: %w", ref, err)
+		}
+		if msg.ErrorDetail != nil && msg.ErrorDetail.Message != "" {
+			return fmt.Errorf("image pull %s failed: %s", ref, msg.ErrorDetail.Message)
+		}
+		if msg.Error != "" {
+			return fmt.Errorf("image pull %s failed: %s", ref, msg.Error)
+		}
+	}
 }
 
 func (d *dockerJobAPI) CreateContainer(ctx context.Context, name string, cfg *container.Config, host *container.HostConfig, net *network.NetworkingConfig) (string, error) {
@@ -128,6 +164,9 @@ func (d *dockerJobAPI) InspectContainer(ctx context.Context, id string) (contain
 		state.ExitCode = inspect.State.ExitCode
 		state.Running = inspect.State.Running
 	}
+	// Whether the container was created with a TTY changes the encoding of its
+	// Docker log stream (framed vs. raw), so the log decoding needs it.
+	state.Tty = inspect.Config != nil && inspect.Config.Tty
 
 	return state, nil
 }

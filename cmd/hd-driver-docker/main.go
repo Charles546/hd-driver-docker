@@ -23,6 +23,9 @@ import (
 
 type dockerDriver struct {
 	*dipper.Driver
+	// jobAPIFor is a test seam that lets a test substitute a fake jobAPI; when
+	// nil, getJobAPI builds the real Docker Engine-backed implementation.
+	jobAPIFor func(ctx context.Context, m *dipper.Message) (context.Context, jobAPI)
 }
 
 var docker = &dockerDriver{}
@@ -60,32 +63,24 @@ func main() {
 
 // getConnection builds a Docker Engine API client for the message. It honors the
 // standard Docker environment (DOCKER_HOST / DOCKER_TLS_VERIFY / DOCKER_CERT_PATH)
-// via client.FromEnv, with an optional per-message `uri` override. Any error from
-// a malformed DOCKER_TLS_VERIFY / DOCKER_CERT_PATH is routed through dipper.Must
-// (the same pattern the podman driver's getConnection uses), which the command
-// wrapper turns into a clean error reply instead of killing the process.
+// via client.FromEnv, with an optional per-message `uri` override. Errors from a
+// malformed DOCKER_TLS_VERIFY / DOCKER_CERT_PATH surface when NewClientWithOpts
+// applies the lazy FromEnv option; dipper.Must turns them into a panic that the
+// command wrapper recovers into a clean error reply instead of killing the
+// process (the same pattern the podman driver's getConnection uses).
 func (d *dockerDriver) getConnection(ctx context.Context, m *dipper.Message) (*client.Client, context.Context) {
-	opts, err := dockerClientOpts(m)
-	if err != nil {
-		panic(err)
-	}
-	cli := dipper.Must(client.NewClientWithOpts(opts...)).(*client.Client)
+	cli := dipper.Must(client.NewClientWithOpts(dockerClientOpts(m)...)).(*client.Client)
 
 	return cli, ctx
 }
 
-// dockerClientOpts assembles the Docker client options for a message. It routes
-// any panic from client.FromEnv (e.g. a malformed DOCKER_TLS_VERIFY /
-// DOCKER_CERT_PATH) into a clean error so it can be surfaced through the driver's
-// recover path rather than crashing the process.
-func dockerClientOpts(m *dipper.Message) (opts []client.Opt, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("invalid docker client configuration: %v", r)
-		}
-	}()
-
-	opts = []client.Opt{client.FromEnv}
+// dockerClientOpts assembles the Docker client options for a message.
+// client.FromEnv is a lazy Opt (func(*client.Client) error), not a call that
+// runs here, so it can never panic here; any error it returns (e.g. from a
+// malformed DOCKER_TLS_VERIFY / DOCKER_CERT_PATH) is surfaced by
+// NewClientWithOpts and routed through getConnection's dipper.Must.
+func dockerClientOpts(m *dipper.Message) []client.Opt {
+	opts := []client.Opt{client.FromEnv}
 	if uri, ok := dipper.GetMapDataStr(m.Payload, "uri"); ok {
 		opts = append(opts, client.WithHost(uri))
 	}
@@ -94,12 +89,16 @@ func dockerClientOpts(m *dipper.Message) (opts []client.Opt, err error) {
 	// to apply when talking to a Docker daemon.
 	opts = append(opts, client.WithAPIVersionNegotiation())
 
-	return opts, nil
+	return opts
 }
 
 // getJobAPI wraps the per-message connection in the jobAPI abstraction used by
-// the job lifecycle so the lifecycle logic is unit-testable.
+// the job lifecycle so the lifecycle logic is unit-testable. Tests may inject a
+// fake via the dockerDriver.jobAPIFor seam.
 func (d *dockerDriver) getJobAPI(ctx context.Context, m *dipper.Message) (context.Context, jobAPI) {
+	if d.jobAPIFor != nil {
+		return d.jobAPIFor(ctx, m)
+	}
 	conn, ctx := d.getConnection(ctx, m)
 
 	return ctx, newDockerJobAPI(conn)

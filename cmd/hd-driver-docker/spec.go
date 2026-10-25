@@ -204,7 +204,7 @@ func toMounts(v any) ([]mount.Mount, error) {
 		}
 		mm := mount.Mount{
 			Type:   mount.TypeVolume,
-			Target: mustStr(m, "target"),
+			Target: mapStr(m, "target"),
 		}
 		if s, ok := dipper.GetMapDataStr(m, "source"); ok {
 			mm.Source = s
@@ -221,8 +221,9 @@ func toMounts(v any) ([]mount.Mount, error) {
 	return ret, nil
 }
 
-// mustStr extracts a required string field from a map.
-func mustStr(m map[string]any, key string) string {
+// mapStr extracts an optional string field from a map, returning "" when the
+// field is absent or not a string.
+func mapStr(m map[string]any, key string) string {
 	if v, ok := dipper.GetMapDataStr(m, key); ok {
 		return v
 	}

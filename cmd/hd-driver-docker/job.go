@@ -128,6 +128,9 @@ type containerState struct {
 	Status   string // one of container.State* (created/running/exited/...)
 	ExitCode int
 	Running  bool
+	// Tty records whether the container was created with a TTY, which changes
+	// how its Docker log stream is encoded (see decodeJobLog).
+	Tty bool
 }
 
 // isTerminalState reports whether a container has reached a terminal state.
@@ -499,14 +502,32 @@ func (d *dockerDriver) waitJob(msg *dipper.Message) {
 	if err != nil {
 		panic(err)
 	}
+	roles := rolesOf(containers)
+
+	// Aggregate over the CURRENT states before waiting. If any fatal-set
+	// container is already terminal with a non-zero exit — e.g. an init
+	// container failed and start_job skipped the main container, leaving it
+	// "created" — the job is over and we reply failure immediately. Docker's
+	// Wait on a never-started (created) container blocks until the timeout, so
+	// waiting in that case would hang the command for ~30m (and the wrapper
+	// retries 3x), so it must not be reached.
+	states, err := inspectJobContainers(ctx, api, containers)
+	if err != nil {
+		panic(err)
+	}
+	_, status, reason := fatalSetStatus(states, roles)
+	if status == dipper.FAILURE {
+		replyStatus(msg, status, reason)
+
+		return
+	}
+
+	// Termination condition: the main container must reach a terminal state
+	// (NOT "all containers terminal"). If it is already terminal, skip the wait.
 	_, main, ok := splitJobContainers(containers)
 	if !ok {
 		panic(fmt.Errorf("job %s has no main container", job))
 	}
-	roles := rolesOf(containers)
-
-	// Termination condition: the main container must reach a terminal state
-	// (NOT "all containers terminal"). If it is already terminal, skip the wait.
 	mainState, err := api.InspectContainer(ctx, main.ID)
 	if err != nil {
 		panic(err)
@@ -517,14 +538,18 @@ func (d *dockerDriver) waitJob(msg *dipper.Message) {
 		}
 	}
 
-	// Aggregate exit codes over the fatal set (init containers already finished
-	// before wait_job runs; the main container is now terminal).
-	states, err := inspectJobContainers(ctx, api, containers)
+	// Re-aggregate now that the main container is terminal.
+	states, err = inspectJobContainers(ctx, api, containers)
 	if err != nil {
 		panic(err)
 	}
-	_, status, reason := fatalSetStatus(states, roles)
+	_, status, reason = fatalSetStatus(states, roles)
 
+	replyStatus(msg, status, reason)
+}
+
+// replyStatus replies to a command message with a status and an optional reason.
+func replyStatus(msg *dipper.Message, status, reason string) {
 	ret := dipper.Message{Labels: map[string]string{"status": status}}
 	if reason != "" {
 		ret.Labels["reason"] = reason
@@ -546,6 +571,13 @@ func (d *dockerDriver) getJobLog(msg *dipper.Message) {
 	if err != nil {
 		panic(err)
 	}
+	if ce, ok := labels["cleanup_error"]; ok {
+		// Return() only forwards status/reason labels, so a cleanup failure
+		// recorded in labels would otherwise be dropped on the floor. Log it
+		// and surface it to the caller in the payload.
+		log.Warningf("[%s] cleanup of job %s failed: %s", d.Service, job, ce)
+		payload["cleanup_error"] = ce
+	}
 	msg.Reply <- dipper.Message{Payload: payload, Labels: labels}
 }
 
@@ -563,6 +595,14 @@ func fetchJobLog(ctx context.Context, api jobAPI, job string, deleteOnSuccess bo
 	perContainer := map[string]string{}
 	states := []containerState{}
 	for _, c := range containers {
+		st, err := api.InspectContainer(ctx, c.ID)
+		if err != nil {
+			return nil, nil, err
+		}
+		st.Name = c.Name
+		st.Index = c.Index
+		states = append(states, st)
+
 		rc, err := api.ContainerLogs(ctx, c.ID, container.LogsOptions{
 			ShowStdout: true,
 			ShowStderr: true,
@@ -571,7 +611,10 @@ func fetchJobLog(ctx context.Context, api jobAPI, job string, deleteOnSuccess bo
 		if err != nil {
 			return nil, nil, err
 		}
-		text, err := decodeJobLog(rc)
+		// TTY containers produce a raw (unframed) combined stream that must be
+		// read verbatim; non-TTY containers produce an 8-byte-framed
+		// multiplexed stream that must be demuxed with stdcopy.
+		text, err := decodeJobLog(rc, st.Tty)
 		closeErr := rc.Close()
 		if err != nil {
 			return nil, nil, err
@@ -581,25 +624,20 @@ func fetchJobLog(ctx context.Context, api jobAPI, job string, deleteOnSuccess bo
 		}
 		all += text
 		perContainer[c.Name] = text
-
-		st, err := api.InspectContainer(ctx, c.ID)
-		if err != nil {
-			return nil, nil, err
-		}
-		st.Name = c.Name
-		st.Index = c.Index
-		states = append(states, st)
 	}
-	_, status, reason := fatalSetStatus(states, roles)
+	done, status, reason := fatalSetStatus(states, roles)
 
 	labels := map[string]string{"status": status}
 	if reason != "" {
 		labels["reason"] = reason
 	}
 
-	// delete_on_success cleans up ONLY if the job succeeded (main + all init
-	// exit 0), matching the podman driver's `deleteOnSuccess && succeeded`.
-	if deleteOnSuccess && status == dipper.SUCCESS {
+	// delete_on_success cleans up ONLY if the job actually finished (done: every
+	// fatal-set container reached a terminal state) AND every fatal container
+	// exited 0, matching the podman driver's `deleteOnSuccess && succeeded`.
+	// Gating on done is a safety net: a mid-run get_job_log must never stop and
+	// remove a still-running main container.
+	if deleteOnSuccess && done && status == dipper.SUCCESS {
 		if err := removeJob(ctx, api, job); err != nil {
 			labels["cleanup_error"] = err.Error()
 		}
@@ -688,11 +726,19 @@ func removeOneContainer(ctx context.Context, api jobAPI, id string) error {
 	return api.RemoveContainer(ctx, id, true)
 }
 
-// decodeJobLog demultiplexes a Docker Engine log stream. Docker logs are
-// 8-byte-framed when the container is created without a TTY, so the stream must
-// be decoded with stdcopy before use; otherwise every line carries a garbage
-// header. Both stdout and stderr are combined into a single text.
-func decodeJobLog(r io.Reader) (string, error) {
+// decodeJobLog decodes a Docker Engine log stream into a single text blob.
+// Docker logs are 8-byte-framed (stdout/stderr multiplexed) when the container
+// was created WITHOUT a TTY, so the stream must be demultiplexed with stdcopy;
+// otherwise every line carries a garbage header. A TTY container instead
+// produces a raw, already-combined stream — running it through stdcopy would
+// misinterpret the payload bytes as frame headers and corrupt the output — so
+// TTY streams are read verbatim.
+func decodeJobLog(r io.Reader, tty bool) (string, error) {
+	if tty {
+		b, err := io.ReadAll(r)
+
+		return string(b), err
+	}
 	var buf bytes.Buffer
 	if _, err := stdcopy.StdCopy(&buf, &buf, r); err != nil {
 		return "", err

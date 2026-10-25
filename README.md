@@ -32,10 +32,10 @@ Phase 1 implements the driver core — the run-to-complete job lifecycle:
 
 | Command | Interruptible | Purpose |
 |---|---|---|
-| `create_job` | | Pull images, create (but do not start) all containers, set up the shared work volume. Replies `{pod_id, container_ids}`. |
+| `create_job` | | Pull images (surfacing pull-stream failures as errors), create (but do not start) all containers, set up the shared work volume. Replies `{pod_id, container_ids}`. |
 | `start_job` | yes (30m) | Docker-native init sequencing: run init containers one-by-one, fail fast on an init failure (skipping main), then start main. Resumable on re-queue. |
-| `wait_job` | yes (30m) | Blocks until the **main** container reaches a terminal state, then reports success/failure over the fatal set. |
-| `get_job_log` | | Combined stdout/stderr for all containers (with timestamps), plus `status`/`reason`; honors `delete_on_success`. |
+| `wait_job` | yes (30m) | Blocks until the **main** container reaches a terminal state, then reports success/failure over the fatal set. If an init container already failed (so main was never started), it replies failure immediately instead of waiting on a never-started container. |
+| `get_job_log` | | Combined stdout/stderr for all containers (with timestamps), plus `status`/`reason`; honors `delete_on_success`. Non-TTY container logs are demultiplexed (stdcopy); TTY container logs are read verbatim. |
 | `delete_job` | | Unconditional cleanup of the whole job (containers in any state, then the driver-created work volume). Idempotent. |
 
 `exec`, `create_volume`, `delete_volume`, and the `get_pod_log_tail` RPC are
@@ -73,8 +73,11 @@ re-queued command.
 - The **daemon never cleans up** after a job. Jobs **linger by default** after
   the workflow finishes, so logs and artifacts stay inspectable.
 - **Success cleanup** is opt-in via `delete_on_success: true` on `get_job_log`,
-  which deletes the job **only** if the main container and all init containers
-  exited `0` (matching podman's `deleteOnSuccess && succeeded`).
+  which deletes the job **only** if the job has actually finished (every
+  fatal-set container reached a terminal state) and the main container and all
+  init containers exited `0` (matching podman's `deleteOnSuccess && succeeded`).
+  Gating on "finished" is a safety net: a mid-run `get_job_log` never deletes a
+  still-running job.
 - **Failure cleanup** is explicit: call `delete_job` (or set `delete_on_success`
   and rely on `wait_job`'s failure path).
 - The **driver-created work volume dies with the job**: `delete_job` removes all
