@@ -16,6 +16,7 @@ import (
 	"strings"
 
 	"github.com/containerd/errdefs"
+	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
@@ -36,8 +37,9 @@ type jobContainer struct {
 	WorkVolumeOwned bool
 }
 
-// jobAPI abstracts the Docker Engine operations the job lifecycle needs, so the
-// sequencing and cleanup logic is unit-testable against a fake implementation.
+// jobAPI abstracts the Docker Engine operations the driver needs, so the job
+// lifecycle, exec, volume and log-tail logic is unit-testable against a fake
+// implementation.
 type jobAPI interface {
 	ImageExists(ctx context.Context, ref string) (bool, error)
 	PullImage(ctx context.Context, ref string) error
@@ -50,8 +52,11 @@ type jobAPI interface {
 	ListContainers(ctx context.Context, jobID string) ([]jobContainer, error)
 	ContainerLogs(ctx context.Context, id string, opts container.LogsOptions) (io.ReadCloser, error)
 	VolumeExists(ctx context.Context, name string) (bool, error)
-	CreateVolume(ctx context.Context, name string) error
-	RemoveVolume(ctx context.Context, name string) error
+	CreateVolume(ctx context.Context, opts volume.CreateOptions) error
+	RemoveVolume(ctx context.Context, name string, force bool) error
+	ExecCreate(ctx context.Context, containerID string, opts container.ExecOptions) (string, error)
+	ExecAttach(ctx context.Context, execID string, opts container.ExecAttachOptions) (io.ReadCloser, error)
+	ExecInspect(ctx context.Context, execID string) (container.ExecInspect, error)
 }
 
 // dockerJobAPI is the production jobAPI backed by the Docker Engine API client.
@@ -215,14 +220,53 @@ func (d *dockerJobAPI) VolumeExists(ctx context.Context, name string) (bool, err
 	return false, err
 }
 
-func (d *dockerJobAPI) CreateVolume(ctx context.Context, name string) error {
-	_, err := d.cli.VolumeCreate(ctx, volume.CreateOptions{Name: name})
+func (d *dockerJobAPI) CreateVolume(ctx context.Context, opts volume.CreateOptions) error {
+	_, err := d.cli.VolumeCreate(ctx, opts)
 
 	return err
 }
 
-func (d *dockerJobAPI) RemoveVolume(ctx context.Context, name string) error {
-	return d.cli.VolumeRemove(ctx, name, false)
+func (d *dockerJobAPI) RemoveVolume(ctx context.Context, name string, force bool) error {
+	return d.cli.VolumeRemove(ctx, name, force)
+}
+
+func (d *dockerJobAPI) ExecCreate(ctx context.Context, containerID string, opts container.ExecOptions) (string, error) {
+	resp, err := d.cli.ContainerExecCreate(ctx, containerID, opts)
+	if err != nil {
+		return "", err
+	}
+
+	return resp.ID, nil
+}
+
+func (d *dockerJobAPI) ExecAttach(ctx context.Context, execID string, opts container.ExecAttachOptions) (io.ReadCloser, error) {
+	resp, err := d.cli.ContainerExecAttach(ctx, execID, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	return &hijackedReadCloser{resp: resp}, nil
+}
+
+func (d *dockerJobAPI) ExecInspect(ctx context.Context, execID string) (container.ExecInspect, error) {
+	return d.cli.ContainerExecInspect(ctx, execID)
+}
+
+// hijackedReadCloser adapts a docker types.HijackedResponse (the stream returned
+// by an exec attach) to an io.ReadCloser. The hijacked connection must be closed
+// explicitly when reading is done, or the exec session leaks.
+type hijackedReadCloser struct {
+	resp types.HijackedResponse
+}
+
+func (h *hijackedReadCloser) Read(p []byte) (int, error) {
+	return h.resp.Reader.Read(p)
+}
+
+func (h *hijackedReadCloser) Close() error {
+	h.resp.Close()
+
+	return nil
 }
 
 // firstContainerName returns the first container name, stripping the leading

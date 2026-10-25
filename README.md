@@ -38,10 +38,49 @@ Phase 1 implements the driver core — the run-to-complete job lifecycle:
 | `get_job_log` | | Combined stdout/stderr for all containers (with timestamps), plus `status`/`reason`; honors `delete_on_success`. Non-TTY container logs are demultiplexed (stdcopy); TTY container logs are read verbatim. |
 | `delete_job` | | Unconditional cleanup of the whole job (containers in any state, then the driver-created work volume). Idempotent. |
 
-`exec`, `create_volume`, `delete_volume`, and the `get_pod_log_tail` RPC are
-registered in `main.go` as part of the stable command surface but belong to
-**Phase 2** (exec, volumes, log-tail streaming RPC); until then they reply with
-a clean "not implemented in phase 1" error.
+## Phase 2 scope
+
+Phase 2 adds the remaining command surface — `exec`, volumes, and the
+`get_pod_log_tail` log-tail streaming RPC — completing the driver's stable
+command surface:
+
+| Command / RPC | Purpose |
+|---|---|
+| `exec` | Run a command in a running job container via the Docker exec API. Accepts `command` (array) or `script` + `shell` (default `sh -c`); demuxes the multiplexed 8-byte-framed exec stream with stdcopy (Tty:false) and polls exec inspect for the exit code. Replies `{output, exit_code}` plus `status`/`reason`. |
+| `create_volume` | Create a named Docker volume. Accepts `name`, optional `ignore_if_exists`, and optional `volume_spec` (volume.CreateOptions fields: `driver`, `driver_opts`, `labels`) decoded via mapstructure. Names are validated against Docker's volume-name charset `[a-zA-Z0-9][a-zA-Z0-9_.-]*`. Replies `{volume_name}`. |
+| `delete_volume` | Remove a named Docker volume. Accepts `name` (or `volume_name`, for config-bundle compatibility) and optional `force`. Names are validated like `create_volume`. |
+| `get_pod_log_tail` (RPC) | Streams a job's container logs to the operator/UI in chunks, porting the podman driver's model to Docker. Reply shape `{lines, next_cursor: {containers: {...}}, has_more, done, truncated}` plus `status`/`reason`. |
+
+### `get_pod_log_tail` design
+
+- **Cursor model**: per-container `{ts, skip}`; `ts` is the RFC3339Nano timestamp
+  of the last emitted line, `skip` is how many lines at that boundary timestamp
+  were already emitted. A bare integer cursor is accepted for backward
+  compatibility (interpreted as `skip` with no timestamp). `skip` is clamped ≥ 0.
+  The cursor map may be nested under a `containers` key.
+- **`include_containers`** filters by the full container **name** (the
+  `-hd-<sessionID>-<cursor>-c` suffixed name from `create_job`), which is why
+  Phase 1 names containers deterministically.
+- **Fetch**: the Docker logs API is called with `Timestamps:true`; when a cursor
+  timestamp is present it is used as the (inclusive) `since` boundary, otherwise
+  a `tail` limit is used for the first fetch. The `skip` counter dedupes the
+  boundary lines Docker's inclusive `since` re-serves.
+- **Demux**: log streams are demultiplexed with stdcopy; TTY container streams
+  are read verbatim (the same TTY-vs-framed distinction Phase 1 established for
+  `get_job_log`).
+- **Clamping & polling**: `max_lines` defaults to 200, `done_max_lines` to 5000,
+  with a hard cap `hardTailMaxLines` of 10000. The handler polls every ~300ms
+  until lines arrive, the job is done, or the `wait_seconds` deadline (default 3)
+  passes.
+- **`done`/`status`** come from the Phase 1 `fatalSetStatus` over the **fatal
+  set only**: a long-running non-fatal container (future sidecar) never holds
+  `done=false`, and a non-fatal container's non-zero exit never flips the
+  streamed status. When `done=true` the final fetch is widened to
+  `done_max_lines` (the two-phase re-chunk).
+- **Done-stream note**: once `done=true` triggers the final `done_max_lines`
+  fetch, a still-running non-fatal container's post-main-exit lines simply end
+  the stream there — they remain retrievable via `get_job_log`. This is by
+  design: the stream is complete once the fatal set reaches its terminal state.
 
 ## Message shape
 
