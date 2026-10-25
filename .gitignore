@@ -40,3 +40,6 @@ settings.json
 **/__debug_bin*
 
 **/*.code-workspace
+
+# locally built driver binary
+/hd-driver-docker
