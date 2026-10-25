@@ -12,11 +12,11 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/containerd/errdefs"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/network"
-	"github.com/containerd/errdefs"
 	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/client"
 )
