@@ -153,7 +153,7 @@ workflows:
         - name: docker_delete_on_success
           description: Set to 'true' to delete the job after it exits successfully.
     with:
-      docker_system: docker
+      docker_system-: docker
     steps:
     - call_function: '{{ .ctx.docker_system}}.create_job'
       export:
@@ -203,7 +203,7 @@ workflows:
             Optional volume configuration (Docker VolumeCreateOptions fields): 'Driver' (string,
             default 'local'), 'DriverOpts' (key/value object), 'Labels' (key/value object).
     with:
-      docker_system: docker
+      docker_system-: docker
     call_function: '{{ .ctx.docker_system}}.create_volume'
     export:
       _output: $ctx.docker_volume_name
@@ -219,7 +219,7 @@ workflows:
           description: >-
             Set to 'true' to delete the volume even if it is currently in use by a container.
     with:
-      docker_system: docker
+      docker_system-: docker
     call_function: '{{ .ctx.docker_system}}.delete_volume'
     export:
       _output: $ctx.docker_volume_name
@@ -234,7 +234,7 @@ workflows:
         - name: docker_job_id
           description: Required. The job ID returned by create_job.
     with:
-      docker_system: docker
+      docker_system-: docker
     call_function: '{{ .ctx.docker_system}}.delete_job'
     export:
       _output: $ctx.docker_job_id
