@@ -507,10 +507,11 @@ func (d *dockerDriver) waitJob(msg *dipper.Message) {
 	// Aggregate over the CURRENT states before waiting. If any fatal-set
 	// container is already terminal with a non-zero exit — e.g. an init
 	// container failed and start_job skipped the main container, leaving it
-	// "created" — the job is over and we reply failure immediately. Docker's
-	// Wait on a never-started (created) container blocks until the timeout, so
-	// waiting in that case would hang the command for ~30m (and the wrapper
-	// retries 3x), so it must not be reached.
+	// "created" — the job is over and we reply failure immediately. Waiting on
+	// a never-started (created) main returns immediately with exit code 0
+	// (Docker's Wait condition is already met for a non-running container) and
+	// would report a failed job as success; the pre-wait aggregation makes the
+	// failure explicit and immediate instead.
 	states, err := inspectJobContainers(ctx, api, containers)
 	if err != nil {
 		panic(err)

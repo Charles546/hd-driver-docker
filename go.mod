@@ -3,6 +3,7 @@ module github.com/Charles546/hd-driver-docker
 go 1.26.1
 
 require (
+	github.com/containerd/errdefs v1.0.0
 	github.com/docker/docker v28.5.1+incompatible
 	github.com/honeydipper/honeydipper/v4 v4.0.0-alpha3
 	github.com/mitchellh/mapstructure v1.5.0
@@ -18,7 +19,6 @@ require (
 	github.com/Microsoft/go-winio v0.6.2 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/cockroachdb/apd/v3 v3.2.1 // indirect
-	github.com/containerd/errdefs v1.0.0 // indirect
 	github.com/containerd/errdefs/pkg v0.3.0 // indirect
 	github.com/containerd/log v0.2.0 // indirect
 	github.com/distribution/reference v0.6.0 // indirect

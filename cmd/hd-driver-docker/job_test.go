@@ -592,7 +592,9 @@ func TestWaitJobPreExitedInitFailureRepliesImmediately(t *testing.T) {
 	assert.Equal(t, dipper.FAILURE, got.Labels["status"])
 	assert.Contains(t, got.Labels["reason"], "init0")
 	// Must NOT wait on the never-started main: Docker's Wait on a "created"
-	// container blocks until timeout (30m, retried 3x).
+	// container returns immediately with exit code 0 (the Wait condition is
+	// already met), which would report the failed job as success; the pre-wait
+	// aggregation makes the failure explicit and immediate instead.
 	assert.False(t, api.hasOp("wait:main"), "must not wait on a never-started main")
 }
 
