@@ -1,0 +1,240 @@
+---
+# By default this config loads hd-driver-docker from the remote driver
+# registry. To use a pre-fetched local binary instead, load this repo with:
+#
+# repos:
+#   - repo: <this repo>
+#     options:
+#       use_local_binary: true
+#
+# Optional repo options for the remote case:
+#   registry: override the named registry (default: charles-gh-pages)
+#   channel: override the release channel (default: stable)
+#   version: pin an exact release version
+drivers:
+  daemon:
+    features:
+      operator:
+        - name: "driver:docker"
+    drivers:
+      docker:
+        name: docker
+        type: '{% if .options.use_local_binary %}builtin{% else %}remote{% end %}'
+        handlerData:
+{% if .options.use_local_binary %}
+          shortName: hd-driver-docker
+{% else %}
+          registry: '{% default "charles-gh-pages" .options.registry %}'
+          channel: '{% default "stable" .options.channel %}'
+{% if .options.version %}
+          version: '{% .options.version %}'
+{% end %}
+{% end %}
+
+systems:
+  docker:
+    functions:
+      create_job:
+        driver: docker
+        rawAction: create_job
+        parameters:
+          pod_spec: $?ctx.docker_pod_spec
+          containers: $?ctx.docker_containers
+          uri: $?sysData.uri
+          identity: $?sysData.identity
+          with_work_volume: $?ctx.docker_with_work_volume
+          use_work_volume: $?ctx.docker_use_work_volume
+          work_volume_mount_point: $?ctx.docker_work_volume_mount_point
+        export:
+          docker_job_id: $?data.pod_id
+          container_ids: $?data.container_ids
+          _log_stream:
+            pod_id: $?data.pod_id
+            provider: docker
+            gh_slug: '{{ resolve_gh_slug .ctx.gh_slug .ctx.git_repo .event.json.repository.full_name }}'
+            stream_token: '{{ sign_pod_id .data.pod_id (resolve_gh_slug .ctx.gh_slug .ctx.git_repo .event.json.repository.full_name) }}'
+      start_job:
+        driver: docker
+        rawAction: start_job
+        parameters:
+          pod_id: $ctx.docker_job_id
+          uri: $?sysData.uri
+          identity: $?sysData.identity
+      wait_job:
+        driver: docker
+        rawAction: wait_job
+        parameters:
+          pod_id: $ctx.docker_job_id
+          uri: $?sysData.uri
+          identity: $?sysData.identity
+      get_job_log:
+        driver: docker
+        rawAction: get_job_log
+        parameters:
+          pod_id: $ctx.docker_job_id
+          uri: $?sysData.uri
+          identity: $?sysData.identity
+          delete_on_success: '{{ empty .ctx.docker_delete_on_success | not | return }}'
+        export:
+          docker_job_log: $data.all,""
+      delete_job:
+        driver: docker
+        rawAction: delete_job
+        parameters:
+          pod_id: $ctx.docker_job_id
+          uri: $?sysData.uri
+          identity: $?sysData.identity
+      exec:
+        driver: docker
+        rawAction: exec
+        parameters:
+          container_id: $ctx.docker_container_id
+          command: $?ctx.docker_exec_command
+          script: $?ctx.docker_exec_script
+          shell: $?ctx.docker_exec_shell
+          uri: $?sysData.uri
+          identity: $?sysData.identity
+        export:
+          docker_exec_output: '{{ .data.output }}'
+          docker_exec_exit_code: '{{ .data.exit_code }}'
+      create_volume:
+        driver: docker
+        rawAction: create_volume
+        parameters:
+          name: $?ctx.docker_volume_name
+          ignore_if_exists: '{{ empty .ctx.docker_volume_ignore_if_exists | not | return }}'
+          volume_spec: $?ctx.docker_volume_spec
+          uri: $?sysData.uri
+          identity: $?sysData.identity
+        export_on_success:
+          docker_volume_name: $data.volume_name
+      delete_volume:
+        driver: docker
+        rawAction: delete_volume
+        parameters:
+          volume_name: $ctx.docker_volume_name
+          force: $?ctx.docker_volume_force
+          uri: $?sysData.uri
+          identity: $?sysData.identity
+
+workflows:
+  run_docker:
+    meta:
+      description: >-
+        Run one or more containers as a Docker job. All containers except the last run as init
+        containers (executed sequentially to completion in order); the last container is the main
+        container. Returns the combined stdout/stderr log output of all containers.
+      inputs:
+        - name: docker_containers
+          type: object
+          description: >-
+            Required. Ordered list of container specifications. Each entry must have an 'image'
+            field and may include 'command' (list), 'env' (key/value object), 'name', 'mounts',
+            'imagePullPolicy' (Always/Never/IfNotPresent), and other Docker container config
+            fields. All containers except the last are treated as init containers.
+        - name: docker_pod_spec
+          type: object
+          description: >-
+            Optional job-level configuration object (Docker container config fields applied to
+            every container, e.g. resource limits, DNS settings). Omit for defaults.
+        - name: docker_with_work_volume
+          description: >-
+            Set to 'true' to create an ephemeral shared volume and mount it to all containers at
+            the path given by docker_work_volume_mount_point (default /local/honeydipper).
+        - name: docker_use_work_volume
+          description: >-
+            Optionally, give the name of an existing volume instead of an ephemeral volume to
+            mount as a shared volume to all containers at the path given by
+            docker_work_volume_mount_point.
+        - name: docker_work_volume_mount_point
+          description: >-
+            Mount path for the shared work volume inside each container. Defaults to
+            /local/honeydipper. Only used when docker_with_work_volume is true.
+        - name: docker_delete_on_success
+          description: Set to 'true' to delete the job after it exits successfully.
+    with:
+      docker_system-: docker
+    steps:
+    - call_function: '{{ .ctx.docker_system}}.create_job'
+      export:
+        docker_error: $?labels.reason
+      export_on_error:
+        docker_error: $labels.reason
+      with:
+        hooks:
+          on_success: $?ctx.docker_on_start
+    - on_error: continue
+      steps:
+        - call_function: '{{ .ctx.docker_system}}.start_job'
+          export:
+            docker_error: $?ctx.docker_error,labels.reason
+          export_on_error:
+            docker_error: $ctx.docker_error,labels.reason
+        - call_function: '{{ .ctx.docker_system}}.wait_job'
+          export:
+            docker_error: $?ctx.docker_error,labels.reason
+          export_on_error:
+            docker_error: $ctx.docker_error,labels.reason
+        - call_function: '{{ .ctx.docker_system}}.get_job_log'
+          export:
+            docker_error: $?ctx.docker_error,labels.reason
+            _output: $data.all,""
+          export_on_error:
+            docker_error: $ctx.docker_error,labels.reason
+
+  create_docker_volume:
+    meta:
+      description: >-
+        Create a named Docker volume for persistent storage. The volume persists across job runs
+        and can be mounted into any run_docker call via docker_use_work_volume. Returns the volume
+        name, which is required for mounting or later deletion.
+      inputs:
+        - name: docker_volume_name
+          description: >-
+            Desired name for the volume. If omitted, Docker auto-generates a name. Store the
+            returned name to mount or delete the volume later.
+        - name: docker_volume_ignore_if_exists
+          description: >-
+            Set to 'true' to succeed silently when a volume with this name already exists, instead
+            of returning an error. Useful for idempotent setup.
+        - name: docker_volume_spec
+          type: object
+          description: >-
+            Optional volume configuration (Docker VolumeCreateOptions fields): 'Driver' (string,
+            default 'local'), 'DriverOpts' (key/value object), 'Labels' (key/value object).
+    with:
+      docker_system-: docker
+    call_function: '{{ .ctx.docker_system}}.create_volume'
+    export:
+      _output: $ctx.docker_volume_name
+
+  delete_docker_volume:
+    meta:
+      description: >-
+        Delete a named Docker volume. Use this to free storage after the data is no longer needed.
+      inputs:
+        - name: docker_volume_name
+          description: Required. Name of the volume to delete.
+        - name: docker_volume_force
+          description: >-
+            Set to 'true' to delete the volume even if it is currently in use by a container.
+    with:
+      docker_system-: docker
+    call_function: '{{ .ctx.docker_system}}.delete_volume'
+    export:
+      _output: $ctx.docker_volume_name
+
+  delete_docker_job:
+    meta:
+      description: >-
+        Delete a Docker job by its job ID. Use this on failure paths to clean up a job that
+        failed before completing. The driver's delete_job is idempotent, so calling this for an
+        already-removed job is a no-op.
+      inputs:
+        - name: docker_job_id
+          description: Required. The job ID returned by create_job.
+    with:
+      docker_system-: docker
+    call_function: '{{ .ctx.docker_system}}.delete_job'
+    export:
+      _output: $ctx.docker_job_id
