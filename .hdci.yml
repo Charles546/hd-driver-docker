@@ -107,6 +107,7 @@ stages:
           relay_track: update-registry
           relay_git_repo: Charles546/honeydipper-registry
           relayed_data:
+            driver_name: docker
             manifest_file: docker.json
             update_latest: true
             update_channel: stable
