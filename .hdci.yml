@@ -12,7 +12,7 @@ cache:
 
 executors:
   golang:
-    image: docker.io/library/golang:1.26.1-alpine
+    image: docker.io/library/golang:1.27.3-alpine
     cache:
       - /go/pkg/mod
       - /go/bin
@@ -72,7 +72,7 @@ stages:
       - job_name: lint
         steps:
           - run: golangci-lint run
-            image: docker.io/golangci/golangci-lint:v2.11.3-alpine
+            image: docker.io/golangci/golangci-lint:v2.15.0-alpine
 
   release:
     requires:
