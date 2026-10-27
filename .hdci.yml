@@ -46,6 +46,7 @@ triggers:
       gh_action: released
     stages:
       - update-registry
+      - back-merge
 
 stages:
   install-and-cache:
@@ -115,3 +116,40 @@ stages:
             sha256: '{{ with .gh_asset_digest }}{{ trimPrefix "sha256:" . }}{{ end }}'
             asset_url: $gh_asset_url,""
             binary_name: $gh_asset_name,""
+  back-merge:
+    jobs:
+      - job_name: back-merge
+        # CRITICAL: the released event's git_ref is a tag refpath
+        # (refs/tags/vX.Y.Z), which the default github_checkout cannot clone
+        # ("Remote branch refs/tags/vX.Y.Z not found"). GITHUB_BRANCH is read
+        # by the checkout via ${GITHUB_BRANCH:-...}, and job-level env reaches
+        # every step container, so force a cloneable branch here. The stage
+        # re-fetches and checks out dev itself, so any valid branch works.
+        env:
+          GITHUB_BRANCH: main
+        steps:
+          - executor: gh
+            skip_executors:
+              - golang
+            env:
+              GH_TOKEN: hd-lookup:github_pat
+            run: |
+              set -e
+              git config --global user.name "HoneyDipper CI"
+              git config --global user.email "honeydipper-ci@example.com"
+
+              git fetch origin main dev
+              git checkout -B dev origin/dev
+
+              if ! git merge --no-edit -m "chore: merge main into dev [skip ci]" origin/main; then
+                echo "ERROR: back-merge conflict; aborting, dev left untouched"
+                git merge --abort
+                exit 1
+              fi
+
+              if git diff --quiet origin/dev HEAD; then
+                echo "dev already up to date with main; nothing to push"
+                exit 0
+              fi
+
+              git push origin HEAD:dev
