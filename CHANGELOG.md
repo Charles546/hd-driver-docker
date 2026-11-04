@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### CI
+
+- **Automate the `main` → `dev` back-merge after releases.** On the `released`
+  event, HDCI back-merges `main` into `dev` as a new merge commit so the
+  semantic-release CHANGELOG commit flows back to `dev` automatically, keeping
+  future promotion PRs conflict-free.
+
 ### Security
 
 - **Upgrade the build to Go 1.27.3** to address the CVE affecting Go 1.26 and
