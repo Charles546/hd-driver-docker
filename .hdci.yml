@@ -85,7 +85,9 @@ stages:
             run: |
               cp /go/bin/hd-driver-docker ./hd-driver-docker-linux-amd64
 
-              apk add --no-cache git
+              apk add --no-cache git github-cli
+              git config --global credential.helper "!gh auth git-credential"
+
               npm install -g semantic-release \
                 @semantic-release/changelog \
                 @semantic-release/git \
