@@ -29,7 +29,7 @@ triggers:
       git_ref!:
         - 'refs/heads/main'
         - ":regex:^refs\\/tags\\/v.*"
-      git_commit_message!: ':regex:.*\[skip ci\].*'
+      git_commit_subject!: ':regex:.*\[skip ci\].*'
     stages:
       - install-and-cache
       - test
@@ -37,7 +37,7 @@ triggers:
   - conditions:
       gh_event: push
       git_ref: 'refs/heads/main'
-      git_commit_message!: ':regex:.*\[skip ci\].*'
+      git_commit_subject!: ':regex:.*\[skip ci\].*'
     stages:
       - install-and-cache
       - release
